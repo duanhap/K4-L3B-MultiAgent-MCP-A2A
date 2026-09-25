@@ -91,8 +91,15 @@ async def run_policy_agent(
     recommended_refund_brl = 0.0
     refund_lines: list[dict[str, Any]] = []
     resolution_actions: list[str] = []
+    reason_code = "GENERAL_DISPUTE_REFUND"
 
-    # 1. Determine primary issue & causes & responsible parties
+    # Helper: check if any claim topic matches a pattern
+    def has_claim(pattern: str) -> bool:
+        return any(pattern in t for t in claim_topics)
+
+    # --- PRIORITY ORDER (most specific → most general) ---
+
+    # P1. Order canceled but payment was captured
     if "canceled" in order_statuses and captured_total > 0:
         primary_issue = "canceled_order_paid"
         ranked_causes.append({"cause_code": "ORDER_CANCELED_BEFORE_FULFILLMENT", "rank": 1})
@@ -104,6 +111,7 @@ async def run_policy_agent(
         reason_code = "FULL_REFUND_ORDER_CANCELED"
         resolution_actions.extend(["process_full_refund", "notify_customer"])
 
+    # P2. Order unavailable but payment was captured
     elif "unavailable" in order_statuses and captured_total > 0:
         primary_issue = "unavailable_order_paid"
         ranked_causes.append({"cause_code": "ITEM_OUT_OF_STOCK_AFTER_PAYMENT", "rank": 1})
@@ -112,18 +120,22 @@ async def run_policy_agent(
         reason_code = "FULL_REFUND_ORDER_UNAVAILABLE"
         resolution_actions.extend(["process_full_refund", "cancel_order_record"])
 
+    # P3. Seller dispatch delay (shipping_limit_date breach)
     elif shipment_verdict == "seller_delay":
         primary_issue = "late_delivery_seller"
         ranked_causes.append({"cause_code": "SELLER_DISPATCH_SLA_BREACH", "rank": 1})
         for sid in shipment_result.late_seller_ids or order_result.seller_ids:
             responsible_parties.append({"party_type": "seller", "party_id": sid})
-        if refundable_total > 0 and any("refund" in t for t in claim_topics):
+        if not responsible_parties:
+            responsible_parties.append({"party_type": "seller", "party_id": None})
+        if refundable_total > 0 and has_claim("refund"):
             recommended_refund_brl = refundable_total
             reason_code = "REFUND_SELLER_DELAY"
             resolution_actions.extend(["issue_seller_penalty", "process_refund_for_delay"])
         else:
             resolution_actions.extend(["issue_seller_penalty", "notify_seller_sla_breach"])
 
+    # P4. Logistics/carrier delay (seller shipped on time, carrier was late)
     elif shipment_verdict == "logistics_delay":
         primary_issue = "late_delivery_logistics"
         ranked_causes.append({"cause_code": "CARRIER_TRANSIT_DELAY", "rank": 1})
@@ -131,24 +143,14 @@ async def run_policy_agent(
             responsible_parties.append({"party_type": "logistics_provider", "party_id": sh_id})
         if not responsible_parties:
             responsible_parties.append({"party_type": "logistics_provider", "party_id": None})
-        if refundable_total > 0 and any("full_refund" in t for t in claim_topics):
-            # If customer specifically demanded refund on delivery delay
-            recommended_refund_brl = round(refundable_total * 0.2, 2)  # shipping fee credit or partial refund
-            if recommended_refund_brl == 0.0 and refundable_total > 0:
-                recommended_refund_brl = refundable_total
+        if refundable_total > 0 and has_claim("full_refund"):
+            recommended_refund_brl = refundable_total
             reason_code = "PARTIAL_REFUND_LOGISTICS_DELAY"
             resolution_actions.extend(["open_carrier_inquiry", "credit_shipping_fee"])
         else:
             resolution_actions.extend(["open_carrier_inquiry", "update_estimated_delivery"])
 
-    elif payment_verdict == "duplicate_capture":
-        primary_issue = "duplicate_charge"
-        ranked_causes.append({"cause_code": "PAYMENT_GATEWAY_DUPLICATE_TRANSACTION", "rank": 1})
-        responsible_parties.append({"party_type": "payment_provider", "party_id": None})
-        recommended_refund_brl = round(max(0.0, captured_total / 2.0), 2)
-        reason_code = "REFUND_DUPLICATE_CHARGE"
-        resolution_actions.extend(["reverse_duplicate_charge", "notify_payment_processor"])
-
+    # P5. Refund already failed — needs retry
     elif payment_verdict == "refund_failed":
         primary_issue = "refund_failed"
         ranked_causes.append({"cause_code": "PAYMENT_PROCESSOR_REFUND_REJECTED", "rank": 1})
@@ -157,30 +159,64 @@ async def run_policy_agent(
         reason_code = "RETRY_FAILED_REFUND"
         resolution_actions.extend(["retry_refund_transaction", "escalate_to_finance"])
 
+    # P6. Refund in progress but not settled yet
     elif payment_verdict == "refund_pending":
         primary_issue = "refund_pending"
         ranked_causes.append({"cause_code": "REFUND_SETTLEMENT_IN_PROGRESS", "rank": 1})
         responsible_parties.append({"party_type": "platform", "party_id": None})
+        recommended_refund_brl = refundable_total
+        reason_code = "EXPEDITE_PENDING_REFUND"
         resolution_actions.extend(["expedite_refund_settlement", "notify_customer_settlement_timeline"])
 
+    # P7. Payment amount doesn't match order value
     elif payment_verdict == "capture_mismatch":
         primary_issue = "payment_mismatch"
         ranked_causes.append({"cause_code": "PAYMENT_AMOUNT_DISCREPANCY", "rank": 1})
         responsible_parties.append({"party_type": "payment_provider", "party_id": None})
+        recommended_refund_brl = refundable_total if refundable_total > 0 else 0.0
+        reason_code = "RECONCILE_PAYMENT_MISMATCH"
         resolution_actions.extend(["reconcile_discrepancy", "audit_payment_ledger"])
 
+    # P8. Genuine duplicate charge (same payment_type charged twice without installments)
+    elif payment_verdict == "duplicate_capture":
+        primary_issue = "duplicate_charge"
+        ranked_causes.append({"cause_code": "PAYMENT_GATEWAY_DUPLICATE_TRANSACTION", "rank": 1})
+        responsible_parties.append({"party_type": "payment_provider", "party_id": None})
+        # Refund only the duplicate portion (half of captured if one charge was legitimate)
+        recommended_refund_brl = round(max(0.0, captured_total / 2.0), 2)
+        reason_code = "REFUND_DUPLICATE_CHARGE"
+        resolution_actions.extend(["reverse_duplicate_charge", "notify_payment_processor"])
+
+    # P9. Split payment was valid — customer is claiming incorrectly
+    elif payment_verdict == "reconciled" and has_claim("valid_split_payment"):
+        primary_issue = "valid_split_payment"
+        ranked_causes.append({"cause_code": "LEGITIMATE_SPLIT_PAYMENT_TRANSACTION", "rank": 1})
+        responsible_parties.append({"party_type": "customer", "party_id": entity_result.customer_unique_id})
+        resolution_actions.extend(["explain_split_payment_policy", "close_inquiry"])
+
+    # P10. Order delivered on time, payment reconciled — claim unsupported
     elif shipment_verdict == "on_time" and payment_verdict in ("reconciled", "refunded"):
-        # Everything was delivered on time and payment is clean
         primary_issue = "unsupported_claim"
         ranked_causes.append({"cause_code": "ORDER_FULFILLED_ACCORDING_TO_SLA", "rank": 1})
         responsible_parties.append({"party_type": "customer", "party_id": entity_result.customer_unique_id})
         resolution_actions.extend(["reject_claim_with_delivery_proof", "close_inquiry"])
 
+    # P11. Refund already completed
+    elif payment_verdict == "refunded":
+        primary_issue = "unsupported_claim"
+        ranked_causes.append({"cause_code": "REFUND_ALREADY_PROCESSED", "rank": 1})
+        responsible_parties.append({"party_type": "customer", "party_id": entity_result.customer_unique_id})
+        resolution_actions.extend(["inform_customer_refund_completed", "close_inquiry"])
+
+    # P12. Fallback
     else:
         primary_issue = "insufficient_evidence"
         ranked_causes.append({"cause_code": "INSUFFICIENT_EVIDENCE_TO_DETERMINE_CAUSE", "rank": 1})
         responsible_parties.append({"party_type": "unknown", "party_id": None})
         resolution_actions.append("request_additional_information")
+
+    # Unused variable cleanup (walrus operator remnant guard)
+    pass
 
     # Build refund lines if refund recommended
     if recommended_refund_brl > 0:

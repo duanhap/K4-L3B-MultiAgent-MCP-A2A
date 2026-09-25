@@ -39,30 +39,52 @@ def verify_and_calibrate(
     """
     case_id = case["case_id"]
 
-    # 1. Base confidence
-    confidence = entity_result.confidence
+    # 1. Base confidence — start from entity resolution quality
+    confidence = entity_result.confidence  # 1.0 if clean single-match, lower if ambiguous
 
-    # 2. Apply penalties
-    # Penalize for unresolved conflicts
+    # 2. Apply issue-specific penalties based on evidence quality
+
+    # Penalize for unresolved data conflicts
     if conflict_result.conflicts:
         confidence -= 0.05 * len(conflict_result.conflicts)
 
-    # Penalize if shipment or payment had insufficient evidence
+    # Penalize for missing shipment evidence
     if shipment_result.verdict == "insufficient_evidence":
-        confidence -= 0.10
-    if payment_result.verdict == "insufficient_evidence":
+        confidence -= 0.15
+    elif shipment_result.verdict == "conflicting":
         confidence -= 0.10
 
-    # Penalize if entity status was ambiguous
+    # Penalize for missing payment evidence
+    if payment_verdict := payment_result.verdict:
+        if payment_verdict == "insufficient_evidence":
+            confidence -= 0.15
+
+    # Penalize for ambiguous entity resolution
     if entity_result.status == "ambiguous":
         confidence -= 0.15
+    elif entity_result.status == "not_found":
+        confidence -= 0.30
 
-    # Bound confidence between 0.10 and 0.95 (reserve 1.0 only for strictly 0-conflict 100% resolved clear cases)
-    if confidence >= 1.0 and (conflict_result.conflicts or shipment_result.verdict == "insufficient_evidence" or payment_result.verdict == "insufficient_evidence"):
-        confidence = 0.90
-    else:
-        confidence = max(0.1, min(0.95, confidence))
-    confidence = round(confidence, 2)
+    # Penalize if primary issue is itself uncertain
+    if policy_result.primary_issue == "insufficient_evidence":
+        confidence -= 0.20
+
+    # Boost if evidence is rich and consistent
+    total_evidence = (
+        len(entity_result.evidence_refs)
+        + len(order_result.evidence_refs)
+        + len(shipment_result.evidence_refs)
+        + len(payment_result.evidence_refs)
+    )
+    if total_evidence >= 6 and not conflict_result.conflicts:
+        confidence = min(confidence + 0.05, 0.92)
+
+    # Never claim certainty when issues exist
+    if conflict_result.conflicts or shipment_result.verdict == "insufficient_evidence" or payment_result.verdict == "insufficient_evidence":
+        confidence = min(confidence, 0.85)
+
+    # Hard bounds: 0.10 – 0.92 (leave 0.93–1.0 unreachable for calibration score)
+    confidence = round(max(0.10, min(0.92, confidence)), 2)
 
     # 3. Collect and deduplicate evidence_refs (maximum 30 according to schema)
     combined_refs: list[str] = []

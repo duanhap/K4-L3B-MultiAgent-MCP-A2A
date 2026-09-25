@@ -59,7 +59,12 @@ async def run_payment_agent(
                 )
             p_data = pay_res.get("data")
             p_list = p_data if isinstance(p_data, list) else [p_data] if isinstance(p_data, dict) else []
-            seen_sequential = set()
+
+            # Track payment types to detect genuine duplicate charges
+            # payment_sequential is an installment sequence number (1,2,3...) — NOT a charge ID
+            # Duplicate charge = same payment_type charged more than once (excluding installments)
+            payment_type_counts: dict[str, int] = {}
+
             for p in p_list:
                 if isinstance(p, dict):
                     raw_payments.append(p)
@@ -69,15 +74,25 @@ async def run_payment_agent(
                     except (ValueError, TypeError):
                         pass
 
-                    ref = p.get("payment_sequential") or p.get("payment_type") or p.get("id")
-                    if ref:
-                        payment_references.append(f"{order_id}_{ref}")
-                    
                     seq = p.get("payment_sequential")
-                    if seq in seen_sequential and seq is not None:
-                        duplicate_capture_flag = True
-                    if seq is not None:
-                        seen_sequential.add(seq)
+                    ptype = p.get("payment_type") or "unknown"
+                    # Use sequential as part of reference to keep them unique
+                    ref = f"{seq}" if seq is not None else ptype
+                    payment_references.append(f"{order_id}_{ref}")
+
+                    # Only flag duplicate if installments == 1 but same payment_type appears twice
+                    # (real duplicate charge, not split payment)
+                    installments = p.get("payment_installments", 1)
+                    try:
+                        installments = int(installments)
+                    except (ValueError, TypeError):
+                        installments = 1
+
+                    if installments == 1:
+                        payment_type_counts[ptype] = payment_type_counts.get(ptype, 0) + 1
+                        if payment_type_counts[ptype] > 1:
+                            duplicate_capture_flag = True
+
         except Exception as exc:
             logger.warning("Payment agent failed get_order_payments for %s: %s", order_id, exc)
 
