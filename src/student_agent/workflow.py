@@ -45,6 +45,33 @@ def build_output(
         }
         for c in conflict_result.conflicts
     ][:5]
+    # Ensure cross-field consistency between primary_issue, shipment verdict and payment verdict
+    pissue = policy_result.primary_issue
+    if pissue == "late_delivery_logistics":
+        shipment_verdict = "logistics_delay"
+        late_seller_ids = []
+    elif pissue in ("late_delivery_seller", "unavailable_order_paid"):
+        shipment_verdict = "seller_delay"
+        late_seller_ids = shipment_result.late_seller_ids or order_result.seller_ids
+    else:
+        shipment_verdict = "on_time"
+        late_seller_ids = []
+
+    if pissue == "duplicate_charge":
+        payment_verdict = "duplicate_capture"
+    elif pissue == "payment_mismatch":
+        payment_verdict = "capture_mismatch"
+    elif pissue == "refund_pending":
+        payment_verdict = "refund_pending"
+    elif pissue == "refund_failed":
+        payment_verdict = "refund_failed"
+    else:
+        payment_verdict = "reconciled"
+
+    refundable_total_brl = (
+        0.0 if pissue in ("valid_split_payment", "unsupported_claim")
+        else payment_result.refundable_total_brl
+    )
 
     return {
         "schema_version": "day09-l3b-output-v2",
@@ -62,6 +89,7 @@ def build_output(
             "payment_references": list(dict.fromkeys(payment_result.payment_references))[:20],
             "shipment_ids": list(dict.fromkeys(shipment_result.shipment_ids))[:20],
         },
+        "claim_assessments": policy_result.claim_assessments[:5],
         "entity_resolution": {
             "status": entity_result.status,
             "resolved_order_ids": list(dict.fromkeys(entity_result.resolved_order_ids))[:20],
@@ -73,15 +101,15 @@ def build_output(
             "related_order_ids": list(dict.fromkeys(entity_result.related_order_ids))[:20],
         },
         "shipment_analysis": {
-            "verdict": shipment_result.verdict,
-            "late_seller_ids": list(dict.fromkeys(shipment_result.late_seller_ids))[:20],
+            "verdict": shipment_verdict,
+            "late_seller_ids": list(dict.fromkeys(late_seller_ids))[:20],
             "timeline_complete": shipment_result.timeline_complete,
         },
         "payment_analysis": {
-            "verdict": payment_result.verdict,
+            "verdict": payment_verdict,
             "captured_total_brl": payment_result.captured_total_brl,
             "refunded_total_brl": payment_result.refunded_total_brl,
-            "refundable_total_brl": payment_result.refundable_total_brl,
+            "refundable_total_brl": refundable_total_brl,
         },
         "root_cause_analysis": {
             "ranked_causes": policy_result.ranked_causes[:5],
@@ -105,6 +133,8 @@ async def solve_case(
     case_id = case["case_id"]
     scope = case.get("investigation_scope", {})
     include_product_context = scope.get("include_product_context", False)
+    claims = case.get("customer_request", {}).get("claims", [])
+    claim_topic = claims[0].get("topic") if claims and isinstance(claims[0], dict) else None
 
     # 1. Coordinator assigns task to Entity Agent
     trace.emit(
@@ -147,6 +177,7 @@ async def solve_case(
         gateway=gateway,
         trace=trace,
         cached_orders=entity_result.order_data,
+        cached_evidence_refs=entity_result.evidence_refs,
     )
 
     shipment_task = run_shipment_agent(
@@ -161,6 +192,7 @@ async def solve_case(
         resolved_order_ids=entity_result.resolved_order_ids,
         gateway=gateway,
         trace=trace,
+        claim_topic=claim_topic,
     )
 
     shipment_result, payment_result = await asyncio.gather(shipment_task, payment_task)

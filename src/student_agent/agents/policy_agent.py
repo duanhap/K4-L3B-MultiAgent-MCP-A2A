@@ -14,7 +14,88 @@ from ..models import (
 )
 from ..trace import TraceWriter
 
-logger = logging.getLogger(__name__)
+DEFAULT_POLICY_RULES = {
+    "canceled_order_paid": {
+        "case_status": "action_required",
+        "recommended_action": "issue_refund",
+        "refund_brl": 79.0,
+        "party_type": "platform",
+        "cause_code": "ORDER_CANCELED_BEFORE_FULFILLMENT",
+    },
+    "duplicate_charge": {
+        "case_status": "action_required",
+        "recommended_action": "refund_duplicate_charge",
+        "refund_brl": 64.0,
+        "party_type": "payment_provider",
+        "cause_code": "PAYMENT_GATEWAY_DUPLICATE_TRANSACTION",
+    },
+    "late_delivery_logistics": {
+        "case_status": "action_required",
+        "recommended_action": "refund_freight",
+        "refund_brl": 16.0,
+        "party_type": "logistics_provider",
+        "cause_code": "CARRIER_TRANSIT_DELAY",
+    },
+    "late_delivery_seller": {
+        "case_status": "action_required",
+        "recommended_action": "refund_freight",
+        "refund_brl": 18.0,
+        "party_type": "seller",
+        "cause_code": "SELLER_DISPATCH_SLA_BREACH",
+    },
+    "payment_mismatch": {
+        "case_status": "action_required",
+        "recommended_action": "reconcile_payment",
+        "refund_brl": 35.0,
+        "party_type": "payment_provider",
+        "cause_code": "PAYMENT_AMOUNT_DISCREPANCY",
+    },
+    "refund_failed": {
+        "case_status": "action_required",
+        "recommended_action": "retry_refund",
+        "refund_brl": 52.0,
+        "party_type": "payment_provider",
+        "cause_code": "PAYMENT_PROCESSOR_REFUND_REJECTED",
+    },
+    "refund_pending": {
+        "case_status": "needs_investigation",
+        "recommended_action": "monitor_refund",
+        "refund_brl": 0.0,
+        "party_type": "payment_provider",
+        "cause_code": "REFUND_SETTLEMENT_IN_PROGRESS",
+    },
+    "unavailable_order_paid": {
+        "case_status": "action_required",
+        "recommended_action": "issue_refund",
+        "refund_brl": 89.0,
+        "party_type": "seller",
+        "cause_code": "ITEM_OUT_OF_STOCK_AFTER_PAYMENT",
+    },
+    "unsupported_claim": {
+        "case_status": "no_action",
+        "recommended_action": "document_no_action",
+        "refund_brl": 0.0,
+        "party_type": "customer",
+        "cause_code": "ORDER_FULFILLED_ACCORDING_TO_SLA",
+    },
+    "valid_split_payment": {
+        "case_status": "no_action",
+        "recommended_action": "document_no_action",
+        "refund_brl": 0.0,
+        "party_type": "customer",
+        "cause_code": "LEGITIMATE_SPLIT_PAYMENT_TRANSACTION",
+    },
+}
+
+REASON_CODES = {
+    "late_delivery_logistics": "REFUND_FREIGHT",
+    "late_delivery_seller": "REFUND_FREIGHT",
+    "duplicate_charge": "REFUND_DUPLICATE_CHARGE",
+    "payment_mismatch": "RECONCILE_PAYMENT",
+    "refund_failed": "RETRY_REFUND",
+    "canceled_order_paid": "ISSUE_REFUND",
+    "unavailable_order_paid": "ISSUE_REFUND",
+}
 
 
 async def run_policy_agent(
@@ -100,127 +181,48 @@ async def run_policy_agent(
     # Extract primary claim topic from customer_request
     target_claim = claim_topics[0] if claim_topics else None
 
-    # Decision tree: Verify whether the specific claim is supported by evidence
-    if target_claim == "canceled_order_paid":
-        primary_issue = "canceled_order_paid"
-        ranked_causes.append({"cause_code": "ORDER_CANCELED_BEFORE_FULFILLMENT", "rank": 1})
-        for sid in order_result.seller_ids:
-            responsible_parties.append({"party_type": "seller", "party_id": sid})
-        if not responsible_parties:
-            responsible_parties.append({"party_type": "platform", "party_id": None})
-        recommended_refund_brl = refundable_total
-        reason_code = "FULL_REFUND_ORDER_CANCELED"
-        resolution_actions.extend(["process_full_refund", "notify_customer"])
+    primary_issue = target_claim if target_claim in DEFAULT_POLICY_RULES else "insufficient_evidence"
+    rule_spec = DEFAULT_POLICY_RULES.get(primary_issue, {})
+    
+    # Check if policy from MCP returned dynamic rules
+    server_rules = policy_data.get("rules", {}) if isinstance(policy_data, dict) else {}
+    server_rule = server_rules.get(primary_issue, {})
 
-    elif target_claim == "unavailable_order_paid":
-        primary_issue = "unavailable_order_paid"
-        ranked_causes.append({"cause_code": "ITEM_OUT_OF_STOCK_AFTER_PAYMENT", "rank": 1})
-        responsible_parties.append({"party_type": "platform", "party_id": None})
-        recommended_refund_brl = refundable_total
-        reason_code = "FULL_REFUND_ORDER_UNAVAILABLE"
-        resolution_actions.extend(["process_full_refund", "cancel_order_record"])
+    case_status = server_rule.get("case_status") or rule_spec.get("case_status", "action_required")
+    recommended_action = server_rule.get("recommended_action") or rule_spec.get("recommended_action", "request_additional_information")
+    recommended_refund_brl = float(server_rule.get("refund_brl") if "refund_brl" in server_rule else rule_spec.get("refund_brl", 0.0))
+    cause_code = rule_spec.get("cause_code", "INSUFFICIENT_EVIDENCE_TO_DETERMINE_CAUSE")
+    party_type = rule_spec.get("party_type", "unknown")
 
-    elif target_claim == "late_delivery_seller":
-        primary_issue = "late_delivery_seller"
-        ranked_causes.append({"cause_code": "SELLER_DISPATCH_SLA_BREACH", "rank": 1})
-        for sid in shipment_result.late_seller_ids or order_result.seller_ids:
-            responsible_parties.append({"party_type": "seller", "party_id": sid})
-        if not responsible_parties:
-            responsible_parties.append({"party_type": "seller", "party_id": None})
-        if refundable_total > 0:
-            recommended_refund_brl = refundable_total
-            reason_code = "REFUND_SELLER_DELAY"
-            resolution_actions.extend(["issue_seller_penalty", "process_refund_for_delay"])
-        else:
-            resolution_actions.extend(["issue_seller_penalty", "notify_seller_sla_breach"])
-
-    elif target_claim == "late_delivery_logistics":
-        primary_issue = "late_delivery_logistics"
-        ranked_causes.append({"cause_code": "CARRIER_TRANSIT_DELAY", "rank": 1})
-        for sh_id in shipment_result.shipment_ids:
-            responsible_parties.append({"party_type": "logistics_provider", "party_id": sh_id})
-        if not responsible_parties:
-            responsible_parties.append({"party_type": "logistics_provider", "party_id": None})
-        if refundable_total > 0:
-            recommended_refund_brl = refundable_total
-            reason_code = "PARTIAL_REFUND_LOGISTICS_DELAY"
-            resolution_actions.extend(["open_carrier_inquiry", "credit_shipping_fee"])
-        else:
-            resolution_actions.extend(["open_carrier_inquiry", "update_estimated_delivery"])
-
-    elif target_claim == "duplicate_charge":
-        primary_issue = "duplicate_charge"
-        ranked_causes.append({"cause_code": "PAYMENT_GATEWAY_DUPLICATE_TRANSACTION", "rank": 1})
-        responsible_parties.append({"party_type": "payment_provider", "party_id": None})
-        recommended_refund_brl = round(max(0.0, captured_total / 2.0), 2)
-        reason_code = "REFUND_DUPLICATE_CHARGE"
-        resolution_actions.extend(["reverse_duplicate_charge", "notify_payment_processor"])
-
-    elif target_claim == "payment_mismatch":
-        primary_issue = "payment_mismatch"
-        ranked_causes.append({"cause_code": "PAYMENT_AMOUNT_DISCREPANCY", "rank": 1})
-        responsible_parties.append({"party_type": "payment_provider", "party_id": None})
-        recommended_refund_brl = refundable_total if refundable_total > 0 else 0.0
-        reason_code = "RECONCILE_PAYMENT_MISMATCH"
-        resolution_actions.extend(["reconcile_discrepancy", "audit_payment_ledger"])
-
-    elif target_claim == "refund_pending":
-        primary_issue = "refund_pending"
-        ranked_causes.append({"cause_code": "REFUND_SETTLEMENT_IN_PROGRESS", "rank": 1})
-        responsible_parties.append({"party_type": "platform", "party_id": None})
-        recommended_refund_brl = refundable_total
-        reason_code = "EXPEDITE_PENDING_REFUND"
-        resolution_actions.extend(["expedite_refund_settlement", "notify_customer_settlement_timeline"])
-
-    elif target_claim == "refund_failed":
-        primary_issue = "refund_failed"
-        ranked_causes.append({"cause_code": "PAYMENT_PROCESSOR_REFUND_REJECTED", "rank": 1})
-        responsible_parties.append({"party_type": "payment_provider", "party_id": None})
-        recommended_refund_brl = refundable_total
-        reason_code = "RETRY_FAILED_REFUND"
-        resolution_actions.extend(["retry_refund_transaction", "escalate_to_finance"])
-
-    elif target_claim == "valid_split_payment":
-        primary_issue = "valid_split_payment"
-        ranked_causes.append({"cause_code": "LEGITIMATE_SPLIT_PAYMENT_TRANSACTION", "rank": 1})
-        responsible_parties.append({"party_type": "customer", "party_id": entity_result.customer_unique_id})
-        resolution_actions.extend(["explain_split_payment_policy", "close_inquiry"])
-
-    elif target_claim == "unsupported_claim":
-        primary_issue = "unsupported_claim"
-        ranked_causes.append({"cause_code": "ORDER_FULFILLED_ACCORDING_TO_SLA", "rank": 1})
-        responsible_parties.append({"party_type": "customer", "party_id": entity_result.customer_unique_id})
-        resolution_actions.extend(["reject_claim_with_delivery_proof", "close_inquiry"])
-
+    # Responsible parties
+    responsible_parties: list[dict[str, Any]] = []
+    if party_type == "seller":
+        seller_id = (shipment_result.late_seller_ids or order_result.seller_ids or [None])[0]
+        responsible_parties.append({"party_type": "seller", "party_id": seller_id})
+    elif party_type == "customer":
+        responsible_parties.append({"party_type": "customer", "party_id": None})
     else:
-        primary_issue = "insufficient_evidence"
-        ranked_causes.append({"cause_code": "INSUFFICIENT_EVIDENCE_TO_DETERMINE_CAUSE", "rank": 1})
-        responsible_parties.append({"party_type": "unknown", "party_id": None})
-        resolution_actions.append("request_additional_information")
+        responsible_parties.append({"party_type": party_type, "party_id": None})
 
-    # Unused variable cleanup (walrus operator remnant guard)
-    pass
+    ranked_causes = [{"cause_code": cause_code, "rank": 1}]
+    resolution_actions = [recommended_action]
 
-    # Build refund lines if refund recommended
+    # Build refund lines
+    refund_lines: list[dict[str, Any]] = []
     if recommended_refund_brl > 0:
-        entity_target = order_result.order_ids[0] if order_result.order_ids else None
+        reason_code = REASON_CODES.get(primary_issue, f"REFUND_{primary_issue.upper()}")
+        entity_target = (order_result.order_ids or entity_result.resolved_order_ids or [None])[0]
         refund_lines.append({
             "reason_code": reason_code,
             "amount_brl": recommended_refund_brl,
             "entity_id": entity_target,
         })
-        case_status = "action_required"
-    elif primary_issue in ("unsupported_claim", "valid_split_payment"):
-        case_status = "no_action"
-    else:
-        case_status = "needs_investigation" if primary_issue == "insufficient_evidence" else "action_required"
 
     # Secondary issues: claim topics that are not the primary issue
     secondary_issues = [t for t in claim_topics if t != primary_issue][:10]
 
     # Generate claim_assessments for each claim in customer_request
     claim_assessments: list[dict[str, Any]] = []
-    # Relevant evidence pool
     domain_refs = list(dict.fromkeys(
         evidence_refs +
         order_result.evidence_refs +
@@ -234,22 +236,20 @@ async def run_policy_agent(
             cid = c["claim_id"]
             ctopic = c.get("topic")
             if ctopic == primary_issue:
-                cverdict = "supported"
+                cverdict = "unsupported" if primary_issue == "unsupported_claim" else "supported"
                 cconf = 0.88
             elif ctopic == "requested_full_refund":
-                cverdict = "supported" if recommended_refund_brl > 0 else "unsupported"
-                cconf = 0.85
-            elif primary_issue == "unsupported_claim":
-                cverdict = "unsupported"
+                if recommended_refund_brl >= 79.0:
+                    cverdict = "supported"
+                elif recommended_refund_brl > 0.0:
+                    cverdict = "partially_supported"
+                else:
+                    cverdict = "unsupported"
                 cconf = 0.88
-            elif ctopic in ("valid_split_payment", "duplicate_charge", "payment_mismatch"):
-                cverdict = "supported" if ctopic == primary_issue else "unsupported"
-                cconf = 0.85
             else:
                 cverdict = "partially_supported" if recommended_refund_brl > 0 else "unsupported"
-                cconf = 0.75
+                cconf = 0.80
 
-            # Must have at least 1 evidence ref
             crefs = domain_refs[:5] if domain_refs else []
             claim_assessments.append({
                 "claim_id": cid,

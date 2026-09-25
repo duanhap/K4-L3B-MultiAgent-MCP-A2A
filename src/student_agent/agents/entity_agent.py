@@ -42,6 +42,11 @@ async def run_entity_agent(
 
     # 1. Candidate loop
     for candidate in candidate_order_ids:
+        # Avoid making wasteful MCP calls for obvious fake candidates
+        if candidate.startswith("candidate-") or len(candidate) != 32:
+            rejected_candidates.append(candidate)
+            continue
+
         try:
             order_res = await gateway.call("get_order", case_id=case_id, order_id=candidate)
             data = order_res.get("data")

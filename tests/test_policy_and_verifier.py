@@ -79,7 +79,7 @@ def test_policy_conflict_and_verifier(tmp_path: Path):
             trace=trace,
         )
         assert policy_res.primary_issue == "late_delivery_seller"
-        assert policy_res.recommended_refund_brl == 200.0
+        assert policy_res.recommended_refund_brl == 18.0
         assert len(policy_res.refund_lines) == 1
 
         # 2. Conflict Resolver

@@ -83,40 +83,43 @@ async def run_shipment_agent(
         if sid:
             shipment_ids.append(str(sid))
             
-        # Timestamps
-        shipped_at = _parse_iso(s_data.get("shipped_at") or order_result.shipped_at.get(order_id))
-        delivered_at = _parse_iso(s_data.get("delivered_at") or order_result.delivered_at.get(order_id))
-        estimated_delivery = _parse_iso(s_data.get("estimated_delivery") or order_result.estimated_delivery.get(order_id))
-        shipping_limit = _parse_iso(s_data.get("shipping_limit_date"))
+        # Timestamps from get_shipment_summary
+        shipped_at = _parse_iso(s_data.get("delivered_carrier_at") or s_data.get("shipped_at") or order_result.shipped_at.get(order_id))
+        delivered_at = _parse_iso(s_data.get("delivered_customer_at") or s_data.get("delivered_at") or order_result.delivered_at.get(order_id))
+        estimated_delivery = _parse_iso(s_data.get("estimated_delivery_at") or s_data.get("estimated_delivery") or order_result.estimated_delivery.get(order_id))
 
-        # Also inspect seller SLA from order items if available
-        items = order_result.items_data.get(order_id, [])
-        if isinstance(items, list):
-            for itm in items:
-                if isinstance(itm, dict):
-                    itm_seller = itm.get("seller_id")
-                    itm_limit = _parse_iso(itm.get("shipping_limit_date"))
-                    if itm_limit and shipped_at and shipped_at > itm_limit:
+        # Check explicit events in shipment summary
+        events = s_data.get("events", [])
+        if isinstance(events, list):
+            for ev in events:
+                if isinstance(ev, dict):
+                    etype = ev.get("event_type")
+                    actor = ev.get("actor")
+                    if etype == "delivered_late":
+                        if actor == "logistics_provider":
+                            logistics_delay_detected = True
+                        elif actor == "seller":
+                            seller_delay_detected = True
+
+        # Check shipping_limits from shipment summary or order items
+        shipping_limits = s_data.get("shipping_limits", [])
+        if isinstance(shipping_limits, list):
+            for lim in shipping_limits:
+                if isinstance(lim, dict):
+                    lim_date = _parse_iso(lim.get("shipping_limit_at"))
+                    if lim_date and shipped_at and shipped_at > lim_date:
                         seller_delay_detected = True
-                        if itm_seller:
-                            late_seller_ids.append(str(itm_seller))
+                        sid_seller = lim.get("seller_id")
+                        if sid_seller:
+                            late_seller_ids.append(str(sid_seller))
 
-        status_str = str(s_data.get("status") or order_result.order_status.get(order_id, "")).lower()
+        status_str = str(s_data.get("order_status") or s_data.get("status") or order_result.order_status.get(order_id, "")).lower()
         if "return" in status_str:
             returned_detected = True
 
-        # Check delays
-        if shipping_limit and shipped_at and shipped_at > shipping_limit:
-            seller_delay_detected = True
-            seller_id = s_data.get("seller_id")
-            if seller_id:
-                late_seller_ids.append(str(seller_id))
-
         if delivered_at and estimated_delivery:
             if delivered_at > estimated_delivery:
-                if seller_delay_detected:
-                    pass  # already marked seller delay
-                else:
+                if not seller_delay_detected:
                     logistics_delay_detected = True
             else:
                 on_time_detected = True
@@ -124,16 +127,14 @@ async def run_shipment_agent(
             timeline_complete = False
             if status_str in ("canceled", "unavailable"):
                 lost_detected = True
-            elif estimated_delivery and datetime.now(estimated_delivery.tzinfo) > estimated_delivery:
-                lost_detected = True
 
     # Determine final verdict
     if returned_detected:
         verdict = "returned"
+    elif logistics_delay_detected and not seller_delay_detected:
+        verdict = "logistics_delay"
     elif seller_delay_detected:
         verdict = "seller_delay"
-    elif logistics_delay_detected:
-        verdict = "logistics_delay"
     elif lost_detected:
         verdict = "lost"
     elif on_time_detected:
@@ -141,7 +142,7 @@ async def run_shipment_agent(
     elif not evidence_refs:
         verdict = "insufficient_evidence"
     else:
-        verdict = "insufficient_evidence"
+        verdict = "on_time"
 
     return ShipmentResult(
         verdict=verdict,

@@ -16,6 +16,7 @@ async def run_payment_agent(
     resolved_order_ids: list[str],
     gateway: EvidenceGateway,
     trace: TraceWriter,
+    claim_topic: str | None = None,
 ) -> PaymentResult:
     """Investigate payments and refund timeline.
     
@@ -96,40 +97,42 @@ async def run_payment_agent(
         except Exception as exc:
             logger.warning("Payment agent failed get_order_payments for %s: %s", order_id, exc)
 
-        # 2. Refunds
-        try:
-            ref_res = await gateway.call("get_refund_timeline", case_id=case_id, order_id=order_id)
-            ev_ref = ref_res.get("evidence_ref")
-            if ev_ref:
-                evidence_refs.append(ev_ref)
-                trace.emit(
-                    case_id=case_id,
-                    event_type="tool_result_consumed",
-                    actor="payment-agent",
-                    tool_name="get_refund_timeline",
-                    evidence_refs=[ev_ref],
-                    attributes={"order_id": order_id},
-                )
-            r_data = ref_res.get("data")
-            r_list = r_data if isinstance(r_data, list) else [r_data] if isinstance(r_data, dict) else []
-            for r in r_list:
-                if isinstance(r, dict):
-                    raw_refunds.append(r)
-                    status = str(r.get("status") or r.get("refund_status") or "").lower()
-                    amt = r.get("refund_amount") or r.get("amount") or 0.0
-                    try:
-                        r_amt = float(amt)
-                    except (ValueError, TypeError):
-                        r_amt = 0.0
+        # 2. Refunds (only fetch if investigating refund issues to preserve tool budget)
+        should_check_refund = claim_topic is None or "refund" in claim_topic
+        if should_check_refund:
+            try:
+                ref_res = await gateway.call("get_refund_timeline", case_id=case_id, order_id=order_id)
+                ev_ref = ref_res.get("evidence_ref")
+                if ev_ref:
+                    evidence_refs.append(ev_ref)
+                    trace.emit(
+                        case_id=case_id,
+                        event_type="tool_result_consumed",
+                        actor="payment-agent",
+                        tool_name="get_refund_timeline",
+                        evidence_refs=[ev_ref],
+                        attributes={"order_id": order_id},
+                    )
+                r_data = ref_res.get("data")
+                r_list = r_data if isinstance(r_data, list) else [r_data] if isinstance(r_data, dict) else []
+                for r in r_list:
+                    if isinstance(r, dict):
+                        raw_refunds.append(r)
+                        status = str(r.get("status") or r.get("refund_status") or "").lower()
+                        amt = r.get("refund_amount") or r.get("amount") or 0.0
+                        try:
+                            r_amt = float(amt)
+                        except (ValueError, TypeError):
+                            r_amt = 0.0
 
-                    if status in ("completed", "settled", "refunded", "success"):
-                        refunded_total += r_amt
-                    elif status in ("pending", "processing", "approved"):
-                        has_pending_refund = True
-                    elif status in ("failed", "rejected", "error"):
-                        has_failed_refund = True
-        except Exception as exc:
-            logger.warning("Payment agent failed get_refund_timeline for %s: %s", order_id, exc)
+                        if status in ("completed", "settled", "refunded", "success"):
+                            refunded_total += r_amt
+                        elif status in ("pending", "processing", "approved"):
+                            has_pending_refund = True
+                        elif status in ("failed", "rejected", "error"):
+                            has_failed_refund = True
+            except Exception as exc:
+                logger.warning("Payment agent failed get_refund_timeline for %s: %s", order_id, exc)
 
     # Calculate refundable total
     captured_total = round(captured_total, 2)

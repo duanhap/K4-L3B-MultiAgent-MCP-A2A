@@ -18,6 +18,7 @@ async def run_order_agent(
     gateway: EvidenceGateway,
     trace: TraceWriter,
     cached_orders: dict[str, Any] | None = None,
+    cached_evidence_refs: list[str] | None = None,
 ) -> OrderResult:
     """Investigate orders, line items, and product details.
     
@@ -35,7 +36,7 @@ async def run_order_agent(
     delivered_at: dict[str, str | None] = {}
     estimated_delivery: dict[str, str | None] = {}
     shipped_at: dict[str, str | None] = {}
-    evidence_refs: list[str] = []
+    evidence_refs: list[str] = list(cached_evidence_refs or [])
     items_data: dict[str, Any] = {}
     product_ids: list[str] = []
 
