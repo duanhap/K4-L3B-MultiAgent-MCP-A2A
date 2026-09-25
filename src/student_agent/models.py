@@ -82,6 +82,7 @@ class PolicyResult:
     refund_lines: list[dict[str, Any]] = field(default_factory=list)
     resolution_actions: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
+    claim_assessments: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

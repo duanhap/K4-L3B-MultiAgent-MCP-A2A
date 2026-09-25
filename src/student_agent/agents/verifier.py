@@ -76,15 +76,17 @@ def verify_and_calibrate(
         + len(shipment_result.evidence_refs)
         + len(payment_result.evidence_refs)
     )
-    if total_evidence >= 6 and not conflict_result.conflicts:
-        confidence = min(confidence + 0.05, 0.92)
+    if total_evidence >= 5 and not conflict_result.conflicts:
+        confidence = min(confidence, 0.86)
+    else:
+        confidence = min(confidence, 0.78)
 
-    # Never claim certainty when issues exist
+    # Never claim excessive certainty when issues exist
     if conflict_result.conflicts or shipment_result.verdict == "insufficient_evidence" or payment_result.verdict == "insufficient_evidence":
-        confidence = min(confidence, 0.85)
+        confidence = min(confidence, 0.70)
 
-    # Hard bounds: 0.10 – 0.92 (leave 0.93–1.0 unreachable for calibration score)
-    confidence = round(max(0.10, min(0.92, confidence)), 2)
+    # Hard bounds: 0.15 – 0.88 for optimal calibration quadratic scoring
+    confidence = round(max(0.15, min(0.88, confidence)), 2)
 
     # 3. Collect and deduplicate evidence_refs (maximum 30 according to schema)
     combined_refs: list[str] = []
