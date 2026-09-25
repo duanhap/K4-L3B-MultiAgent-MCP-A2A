@@ -56,9 +56,9 @@ async def run_policy_agent(
     evidence_refs: list[str] = []
 
     # Optionally call get_policy tool if available (do not fail if absent)
-    policy_data = None
+    policy_version = case.get("policy_version", "EC_POLICY_V2")
     try:
-        policy_res = await gateway.call("get_policy", case_id=case_id, policy_name="dispute_resolution")
+        policy_res = await gateway.call("get_policy", case_id=case_id, policy_version=policy_version)
         ev_ref = policy_res.get("evidence_ref")
         if ev_ref:
             evidence_refs.append(ev_ref)

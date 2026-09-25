@@ -100,12 +100,11 @@ async def run_order_agent(
         except Exception as exc:
             logger.warning("Order agent failed get_order_items for %s: %s", order_id, exc)
 
-    # 3. Product context if requested (capped to max 2 unique products to stay within budget)
-    if include_product_context:
-        unique_pids = list(dict.fromkeys(product_ids))[:2]
-        for pid in unique_pids:
+    # 3. Product context if requested (get_product_context requires order_id)
+    if include_product_context and resolved_order_ids:
+        for oid in resolved_order_ids[:1]:
             try:
-                prod_res = await gateway.call("get_product_context", case_id=case_id, product_id=pid)
+                prod_res = await gateway.call("get_product_context", case_id=case_id, order_id=oid)
                 ev_ref = prod_res.get("evidence_ref")
                 if ev_ref:
                     evidence_refs.append(ev_ref)
@@ -115,10 +114,10 @@ async def run_order_agent(
                         actor="order-agent",
                         tool_name="get_product_context",
                         evidence_refs=[ev_ref],
-                        attributes={"product_id": pid},
+                        attributes={"order_id": oid},
                     )
             except Exception as exc:
-                logger.warning("Order agent failed get_product_context for %s: %s", pid, exc)
+                logger.warning("Order agent failed get_product_context for %s: %s", oid, exc)
 
     return OrderResult(
         order_ids=list(resolved_order_ids),
